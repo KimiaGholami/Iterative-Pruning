@@ -1394,6 +1394,9 @@ class ADMMTrainer(Trainer):
             delattr(self, "_past")
         unwrapped_optimizer.final_projection()
 
+        if hasattr(unwrapped_optimizer, "save_flip_statistics"):
+            unwrapped_optimizer.save_flip_statistics("flip_stats.pt")
+
         if self.is_world_process_zero():
             logger.info('final projection finished')
 

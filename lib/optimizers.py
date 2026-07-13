@@ -120,6 +120,7 @@ def get_admm_optimizer(base_optimizer_cls):
             self.process_group = getattr(accelerator, "process_group", None) if accelerator is not None else None
             self.current_step = 0
             self.mask_metrics = {'step_hamming': 0.0, 'initial_hamming': 0.0, 'step_iou': 0.0, 'initial_iou': 0.0}
+            self.threshold_records = []
 
         def _lazy_init_admm_state(self, p: torch.nn.Parameter, group: Dict):
             """
@@ -201,6 +202,13 @@ def get_admm_optimizer(base_optimizer_cls):
             else:
                 st["split"] = z0.detach().clone().to(device=p.device, dtype=self.split_dtype)
             st["initial_split"] = z0.detach().ne(0).clone().to(device=p.device)
+
+            # Count how many times each weight changes pruning status.
+            st["flip_count"] = torch.zeros_like(
+                p,
+                dtype=torch.int16,
+                memory_format=torch.preserve_format,
+            )
 
         @torch.no_grad()
         def _proximal_update(self):
@@ -349,7 +357,122 @@ def get_admm_optimizer(base_optimizer_cls):
                     new_mask = (new_local != 0)
                     initial_mask = initial_local
 
-                    flip_local_step = (old_mask ^ new_mask).sum().to(device=device)
+                    # Record which individual weights changed pruning status.
+                    flipped = old_mask ^ new_mask
+
+                    flip_count_local = _loc(st["flip_count"])
+                    flip_count_local.add_(flipped.to(torch.int16))
+
+                    # Measure how close weights are to the current pruning cutoff.
+                    # This currently applies to unstructured, layerwise pruning.
+                    if self.prune_n == 0 and self.prune_m == 0:
+                        importance_for_score = importance_i
+
+                        if importance_for_score is not None:
+                            if hasattr(importance_for_score, "dequantize"):
+                                importance_for_score = importance_for_score.dequantize()
+                            elif hasattr(importance_for_score, "dequant"):
+                                importance_for_score = importance_for_score.dequant()
+
+                        if importance_for_score is None:
+                            score = z_in.detach().float().abs()
+                        else:
+                            score = (
+                                _loc(importance_for_score).detach().float()
+                                * _loc(z_in).detach().float().pow(2)
+                            )
+
+                        score_local = _loc(score)
+                        flipped_local = _loc(flipped)
+
+                        num_to_prune = int(score_local.numel() * spars)
+
+                        if num_to_prune > 0 and score_local.numel() > 0:
+                            flat_score = score_local.flatten()
+
+                            threshold_index = min(
+                                num_to_prune,
+                                flat_score.numel()
+                            )
+
+                            threshold = torch.kthvalue(
+                                flat_score,
+                                threshold_index
+                            ).values
+
+                            normalized_margin = (
+                                (score_local - threshold).abs()
+                                / (threshold.abs() + 1e-12)
+                            )
+
+                            flipped_count = int(flipped_local.sum().item())
+                            stable_mask = ~flipped_local
+                            stable_count = int(stable_mask.sum().item())
+
+                            if flipped_count > 0:
+                                flipped_margins = normalized_margin[flipped_local]
+
+                                flipped_mean_margin = float(
+                                    flipped_margins.mean().item()
+                                )
+                                flipped_median_margin = float(
+                                    flipped_margins.median().item()
+                                )
+
+                                within_1pct = float(
+                                    (flipped_margins <= 0.01)
+                                    .float()
+                                    .mean()
+                                    .item()
+                                )
+                                within_5pct = float(
+                                    (flipped_margins <= 0.05)
+                                    .float()
+                                    .mean()
+                                    .item()
+                                )
+                                within_10pct = float(
+                                    (flipped_margins <= 0.10)
+                                    .float()
+                                    .mean()
+                                    .item()
+                                )
+                            else:
+                                flipped_mean_margin = float("nan")
+                                flipped_median_margin = float("nan")
+                                within_1pct = float("nan")
+                                within_5pct = float("nan")
+                                within_10pct = float("nan")
+
+                            if stable_count > 0:
+                                stable_margins = normalized_margin[stable_mask]
+
+                                stable_mean_margin = float(
+                                    stable_margins.mean().item()
+                                )
+                                stable_median_margin = float(
+                                    stable_margins.median().item()
+                                )
+                            else:
+                                stable_mean_margin = float("nan")
+                                stable_median_margin = float("nan")
+
+                            self.threshold_records.append({
+                                "optimizer_step": int(self.current_step),
+                                "tensor_num_weights": int(score_local.numel()),
+                                "threshold": float(threshold.item()),
+                                "flipped_weights": flipped_count,
+                                "stable_weights": stable_count,
+                                "flipped_mean_normalized_margin": flipped_mean_margin,
+                                "flipped_median_normalized_margin": flipped_median_margin,
+                                "stable_mean_normalized_margin": stable_mean_margin,
+                                "stable_median_normalized_margin": stable_median_margin,
+                                "fraction_flips_within_1pct": within_1pct,
+                                "fraction_flips_within_5pct": within_5pct,
+                                "fraction_flips_within_10pct": within_10pct,
+                            })
+
+                    flip_local_step = flipped.sum().to(device=device)
                     flip_local_initial = (initial_mask ^ new_mask).sum().to(device=device)
                     numel_local = torch.tensor(old_local.numel(), device=device)
 
@@ -405,6 +528,88 @@ def get_admm_optimizer(base_optimizer_cls):
             return out
 
         @torch.no_grad()
+        def save_flip_statistics(self, output_path="flip_stats.pt"):
+            global_histogram = None
+            tensor_summaries = []
+            tensor_index = 0
+
+            for group in self.param_groups:
+                if not group.get("admm", False):
+                    continue
+
+                for weight in group["params"]:
+                    state = self.state[weight]
+                    flip_count = state.get("flip_count")
+
+                    if flip_count is None:
+                        continue
+
+                    local_count = _loc(flip_count).to(torch.int64)
+                    max_count = int(local_count.max().item())
+
+                    histogram = torch.bincount(
+                        local_count.flatten(),
+                        minlength=max_count + 1,
+                    ).cpu()
+
+                    if global_histogram is None:
+                        global_histogram = histogram
+                    else:
+                        if histogram.numel() > global_histogram.numel():
+                            padded = torch.zeros(
+                                histogram.numel(),
+                                dtype=global_histogram.dtype,
+                            )
+                            padded[:global_histogram.numel()] = global_histogram
+                            global_histogram = padded
+
+                        if histogram.numel() < global_histogram.numel():
+                            padded = torch.zeros(
+                                global_histogram.numel(),
+                                dtype=histogram.dtype,
+                            )
+                            padded[:histogram.numel()] = histogram
+                            histogram = padded
+
+                        global_histogram += histogram
+
+                    total = local_count.numel()
+
+                    tensor_summaries.append({
+                        "tensor_index": tensor_index,
+                        "shape": tuple(local_count.shape),
+                        "num_weights": total,
+                        "mean_flips": float(local_count.float().mean().item()),
+                        "max_flips": int(local_count.max().item()),
+                        "fraction_ever_flipped": float(
+                            (local_count > 0).float().mean().item()
+                        ),
+                        "fraction_flipped_10_plus": float(
+                            (local_count >= 10).float().mean().item()
+                        ),
+                        "fraction_flipped_50_plus": float(
+                            (local_count >= 50).float().mean().item()
+                        ),
+                    })
+
+                    tensor_index += 1
+
+            if global_histogram is None:
+                global_histogram = torch.zeros(1, dtype=torch.int64)
+
+            result = {
+                "optimizer_steps": self.current_step,
+                "projection_interval": self.interval,
+                "approx_projection_updates": self.current_step // self.interval,
+                "global_histogram": global_histogram,
+                "tensor_summaries": tensor_summaries,
+                "threshold_records": self.threshold_records,
+            }
+
+            torch.save(result, output_path)
+            print(f"[FLIP STATS] Saved to {output_path}")
+
+        @torch.no_grad()
         def final_projection(self):
             """
             Apply the final projection to ADMM-tagged parameter groups (in-place).
@@ -413,9 +618,11 @@ def get_admm_optimizer(base_optimizer_cls):
             for g in self.param_groups:
                 if not g.get("admm", False):
                     continue
+        
                 for w in g["params"]:
                     st = self.state[w]
                     importance = None
+        
                     if self.projection_mode == "momentum":
                         v_t = st.get("exp_avg_sq")
                         if self.projection_bias_correction:
@@ -423,13 +630,45 @@ def get_admm_optimizer(base_optimizer_cls):
                             importance = v_t / (1.0 - beta2**(st.get("step", 1)))
                         else:
                             importance = v_t
+        
                         if isinstance(importance, DTensor):
-                            importance = importance.redistribute(placements=[Replicate()]).to_local()
+                            importance = importance.redistribute(
+                                placements=[Replicate()]
+                            ).to_local()
         
+                    wnew = self.projection(
+                        [w.detach()],
+                        st["sparsity"],
+                        self.prune_n,
+                        self.prune_m,
+                        [importance],
+                        comparison_group="layer",
+                    )[0]
         
-                    wnew = self.projection([w.detach()], st["sparsity"], self.prune_n, self.prune_m,
-                                           [importance], comparison_group="layer")[0]
                     w.data.copy_(wnew)
+        
+            # <-- OUTSIDE the for-loop
+            import os
+        
+            all_flip_counts = []
+        
+            for group in self.param_groups:
+                if not group.get("admm", False):
+                    continue
+        
+                for p in group["params"]:
+                    state = self.state[p]
+                    if "flip_count" not in state:
+                        continue
+        
+                    flip = _loc(state["flip_count"]).cpu().flatten()
+                    all_flip_counts.append(flip)
+        
+            if len(all_flip_counts) > 0:
+                all_flip_counts = torch.cat(all_flip_counts)
+                os.makedirs("analysis", exist_ok=True)
+                torch.save(all_flip_counts, "analysis/flip_counts.pt")
+                print(f"Saved {len(all_flip_counts)} flip counts.")
 
         def get_mask_metrics(self) -> Dict[str, float]:
             """
@@ -464,3 +703,4 @@ def get_admm_optimizer(base_optimizer_cls):
                 return {"avg_lmda": total_lmda / count, "min_lmda": min_lmda, "max_lmda": max_lmda}
 
     return ADMMOptimizer
+

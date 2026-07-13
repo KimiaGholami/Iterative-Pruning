@@ -102,6 +102,10 @@ def _proj_impl_dense(
         # Global threshold within this tensor
         k = int(new_z.numel() * sparsity)
         if k > 0:
+            if a is None:
+                z_metric = weight.detach().abs()
+            else:
+                z_metric = a * weight.detach().pow(2)
             flat_sorted = torch.sort(z_metric.flatten(), stable=True)[0]
             kth = flat_sorted[min(k - 1, flat_sorted.numel() - 1)]
             new_z[z_metric <= kth] = 0
