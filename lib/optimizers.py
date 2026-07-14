@@ -121,6 +121,7 @@ def get_admm_optimizer(base_optimizer_cls):
             self.current_step = 0
             self.mask_metrics = {'step_hamming': 0.0, 'initial_hamming': 0.0, 'step_iou': 0.0, 'initial_iou': 0.0}
             self.threshold_records = []
+            self.dual_dynamics_records = []
 
         def _lazy_init_admm_state(self, p: torch.nn.Parameter, group: Dict):
             """
@@ -209,6 +210,23 @@ def get_admm_optimizer(base_optimizer_cls):
                 dtype=torch.int16,
                 memory_format=torch.preserve_format,
             )
+            st["previous_flipped"] = torch.zeros_like(
+                p,
+                dtype=torch.bool,
+                memory_format=torch.preserve_format,
+            )
+            
+            st["current_flip_streak"] = torch.zeros_like(
+                p,
+                dtype=torch.int16,
+                memory_format=torch.preserve_format,
+            )
+            
+            st["max_flip_streak"] = torch.zeros_like(
+                p,
+                dtype=torch.int16,
+                memory_format=torch.preserve_format,
+            )
 
         @torch.no_grad()
         def _proximal_update(self):
@@ -284,6 +302,16 @@ def get_admm_optimizer(base_optimizer_cls):
                 intersection_initial = torch.tensor(0, device=device, dtype=torch.int64)
                 union_initial = torch.tensor(0, device=device, dtype=torch.int64)
                 numel_sum = torch.tensor(0, device=device, dtype=torch.int64)
+                u_induced_flip_sum = torch.tensor(0, device=device, dtype=torch.int64)
+
+                flipped_u_abs_sum = torch.tensor(0.0, device=device)
+                stable_u_abs_sum = torch.tensor(0.0, device=device)
+                
+                flipped_w_abs_sum = torch.tensor(0.0, device=device)
+                stable_w_abs_sum = torch.tensor(0.0, device=device)
+                
+                flipped_count_for_u = torch.tensor(0, device=device, dtype=torch.int64)
+                stable_count_for_u = torch.tensor(0, device=device, dtype=torch.int64)
 
                 for w in weights:
                     st = self.state[w]
@@ -356,10 +384,69 @@ def get_admm_optimizer(base_optimizer_cls):
                     old_mask = (old_local != 0)
                     new_mask = (new_local != 0)
                     initial_mask = initial_local
-
+                    
                     # Record which individual weights changed pruning status.
                     flipped = old_mask ^ new_mask
+                    
+                    # Counterfactual: what mask would we get from w alone, without the dual u?
+                    w_only_z = self.projection(
+                        [w.detach()],
+                        spars,
+                        self.prune_n,
+                        self.prune_m,
+                        [importance_i],
+                        comparison_group="layer",
+                    )[0]
+                    
+                    w_only_mask = (_loc(w_only_z) != 0)
+                    
+                    # A flip is u-induced when w alone would preserve the old decision,
+                    # but w + u causes the decision to change.
+                    u_induced_flip = (
+                        flipped
+                        & (w_only_mask == old_mask)
+                        & (new_mask != w_only_mask)
+                    )
 
+                    if "u_induced_count" not in st:
+                        st["u_induced_count"] = torch.zeros_like(
+                            flipped,
+                            dtype=torch.int16,
+                        )
+                    
+                    st["u_induced_count"].add_(
+                        u_induced_flip.to(torch.int16)
+                    )
+                    
+                    u_induced_flip_sum += u_induced_flip.sum().to(torch.int64)
+                    
+                    u_abs = _loc(dual).detach().float().abs()
+                    w_abs = _loc(w).detach().float().abs()
+                    
+                    flipped_u_abs_sum += u_abs[flipped].sum()
+                    stable_u_abs_sum += u_abs[~flipped].sum()
+                    
+                    flipped_w_abs_sum += w_abs[flipped].sum()
+                    stable_w_abs_sum += w_abs[~flipped].sum()
+                    
+                    flipped_count_for_u += flipped.sum().to(torch.int64)
+                    stable_count_for_u += (~flipped).sum().to(torch.int64)
+
+                    previous_flipped = _loc(st["previous_flipped"])
+                    current_streak = _loc(st["current_flip_streak"])
+                    max_streak = _loc(st["max_flip_streak"])
+                    
+                    current_streak.copy_(
+                        torch.where(
+                            flipped,
+                            current_streak + 1,
+                            torch.zeros_like(current_streak),
+                        )
+                    )
+                    
+                    max_streak.copy_(torch.maximum(max_streak, current_streak))
+                    previous_flipped.copy_(flipped)
+                    
                     flip_count_local = _loc(st["flip_count"])
                     flip_count_local.add_(flipped.to(torch.int16))
 
@@ -500,6 +587,16 @@ def get_admm_optimizer(base_optimizer_cls):
                     dist.all_reduce(intersection_initial, op=dist.ReduceOp.SUM)
                     dist.all_reduce(union_initial, op=dist.ReduceOp.SUM)
                     dist.all_reduce(numel_sum, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(u_induced_flip_sum, op=dist.ReduceOp.SUM)
+
+                    dist.all_reduce(flipped_u_abs_sum, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(stable_u_abs_sum, op=dist.ReduceOp.SUM)
+                    
+                    dist.all_reduce(flipped_w_abs_sum, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(stable_w_abs_sum, op=dist.ReduceOp.SUM)
+                    
+                    dist.all_reduce(flipped_count_for_u, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(stable_count_for_u, op=dist.ReduceOp.SUM)
 
                 eps = 1e-12
                 self.mask_metrics['step_hamming'] += float(flip_sum_step.float() / (numel_sum.float() + eps))
@@ -512,6 +609,42 @@ def get_admm_optimizer(base_optimizer_cls):
                 self.mask_metrics['initial_hamming'] /= admm_groups
                 self.mask_metrics['step_iou'] /= admm_groups
                 self.mask_metrics['initial_iou'] /= admm_groups
+
+            eps = 1e-12
+
+            total_flips = int(flipped_count_for_u.item())
+            u_induced_flips = int(u_induced_flip_sum.item())
+            
+            self.dual_dynamics_records.append({
+                "optimizer_step": int(self.current_step),
+            
+                "total_flips": total_flips,
+                "u_induced_flips": u_induced_flips,
+            
+                "fraction_flips_u_induced": (
+                    u_induced_flips / max(total_flips, 1)
+                ),
+            
+                "mean_abs_u_flipped": (
+                    float(flipped_u_abs_sum.item())
+                    / max(int(flipped_count_for_u.item()), 1)
+                ),
+            
+                "mean_abs_u_stable": (
+                    float(stable_u_abs_sum.item())
+                    / max(int(stable_count_for_u.item()), 1)
+                ),
+            
+                "mean_abs_w_flipped": (
+                    float(flipped_w_abs_sum.item())
+                    / max(int(flipped_count_for_u.item()), 1)
+                ),
+            
+                "mean_abs_w_stable": (
+                    float(stable_w_abs_sum.item())
+                    / max(int(stable_count_for_u.item()), 1)
+                ),
+            })
 
         @torch.no_grad()
         def step(self, closure=None):
@@ -604,6 +737,7 @@ def get_admm_optimizer(base_optimizer_cls):
                 "global_histogram": global_histogram,
                 "tensor_summaries": tensor_summaries,
                 "threshold_records": self.threshold_records,
+                "dual_dynamics_records": self.dual_dynamics_records,
             }
 
             torch.save(result, output_path)
@@ -651,25 +785,46 @@ def get_admm_optimizer(base_optimizer_cls):
             import os
         
             all_flip_counts = []
-        
+            all_max_streaks = []
+            all_u_induced_counts = []
+            
             for group in self.param_groups:
                 if not group.get("admm", False):
                     continue
-        
+            
                 for p in group["params"]:
                     state = self.state[p]
-                    if "flip_count" not in state:
+            
+                    if (
+                        "flip_count" not in state
+                        or "max_flip_streak" not in state
+                        or "u_induced_count" not in state
+                    ):
                         continue
-        
+            
                     flip = _loc(state["flip_count"]).cpu().flatten()
-                    all_flip_counts.append(flip)
-        
-            if len(all_flip_counts) > 0:
-                all_flip_counts = torch.cat(all_flip_counts)
-                os.makedirs("analysis", exist_ok=True)
-                torch.save(all_flip_counts, "analysis/flip_counts.pt")
-                print(f"Saved {len(all_flip_counts)} flip counts.")
+                    streak = _loc(state["max_flip_streak"]).cpu().flatten()
+                    u_induced = _loc(state["u_induced_count"]).cpu().flatten()
 
+                    all_flip_counts.append(flip)
+                    all_max_streaks.append(streak)
+                    all_u_induced_counts.append(u_induced)
+            
+            if all_flip_counts:
+                all_flip_counts = torch.cat(all_flip_counts)
+                all_max_streaks = torch.cat(all_max_streaks)
+                all_u_induced_counts = torch.cat(all_u_induced_counts)
+            
+                os.makedirs("analysis", exist_ok=True)
+            
+                torch.save(all_flip_counts, "analysis/flip_counts.pt")
+                torch.save(all_max_streaks, "analysis/max_flip_streaks.pt")
+                torch.save(all_u_induced_counts, "analysis/u_induced_counts.pt")
+            
+                print(f"Saved {len(all_flip_counts)} flip counts.")
+                print(f"Saved {len(all_max_streaks)} max flip streaks.")
+        
+           
         def get_mask_metrics(self) -> Dict[str, float]:
             """
             Return the averaged mask metrics computed at the last interval update.
