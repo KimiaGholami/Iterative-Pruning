@@ -122,6 +122,7 @@ def get_admm_optimizer(base_optimizer_cls):
             self.mask_metrics = {'step_hamming': 0.0, 'initial_hamming': 0.0, 'step_iou': 0.0, 'initial_iou': 0.0}
             self.threshold_records = []
             self.dual_dynamics_records = []
+            self.cutoff_neighbors = []
 
         def _lazy_init_admm_state(self, p: torch.nn.Parameter, group: Dict):
             """
@@ -487,6 +488,29 @@ def get_admm_optimizer(base_optimizer_cls):
                                 threshold_index
                             ).values
 
+                            margin = (flat_score - threshold).abs()
+
+                            k = min(100, margin.numel())
+                            
+                            closest = torch.topk(
+                                margin,
+                                k,
+                                largest=False
+                            )
+                            
+                            closest_indices = closest.indices.cpu()
+                            closest_scores = flat_score[closest.indices].cpu()
+                            
+                            self.cutoff_neighbors.append({
+                                "step": int(self.current_step),
+                                "threshold": float(threshold.item()),
+                                "indices": closest_indices,
+                                "scores": closest_scores,
+                            })
+                            
+                            closest_indices = closest.indices.cpu()
+                            closest_scores = flat_score[closest.indices].cpu()
+
                             normalized_margin = (
                                 (score_local - threshold).abs()
                                 / (threshold.abs() + 1e-12)
@@ -665,7 +689,7 @@ def get_admm_optimizer(base_optimizer_cls):
             global_histogram = None
             tensor_summaries = []
             tensor_index = 0
-
+            
             for group in self.param_groups:
                 if not group.get("admm", False):
                     continue
@@ -738,6 +762,7 @@ def get_admm_optimizer(base_optimizer_cls):
                 "tensor_summaries": tensor_summaries,
                 "threshold_records": self.threshold_records,
                 "dual_dynamics_records": self.dual_dynamics_records,
+                "cutoff_neighbors": self.cutoff_neighbors,
             }
 
             torch.save(result, output_path)
