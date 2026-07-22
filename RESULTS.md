@@ -18,6 +18,22 @@
 |-------------------|---------:|-----------:|--------:|
 | facebook/opt-125m |    0%    | 27.6112    | 26.5213 |
 
+## Zero-shot Benchmark Results
+
+### OPT-125M (50% Sparsity)
+
+| Benchmark | Accuracy |
+|-----------|---------:|
+| ARC-Challenge | 0.2304 |
+| ARC-Easy | 0.3750 |
+| BoolQ | 0.6153 |
+| HellaSwag | 0.3027 |
+| OpenBookQA | 0.2620 |
+| PIQA | 0.6039 |
+| RACE | 0.2756 |
+| RTE | 0.5451 |
+| WinoGrande | 0.5201 |
+
 ### Notes
 
 - Successfully reproduced the OPT-125M 90% sparsity results reported in the ELSA paper.
@@ -38,3 +54,5 @@
 |--------------|-----------:|---:|
 | Constant λ schedule + identity projection | 130.1703 | 79.5750 |
 | λ = 0.01 (initial run) | 359.0999 | 132.3388 |
+
+
