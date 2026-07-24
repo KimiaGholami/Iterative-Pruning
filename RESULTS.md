@@ -20,19 +20,19 @@
 
 ## Zero-shot Benchmark Results
 
-### OPT-125M (50% Sparsity)
+## OPT-125M
 
-| Benchmark | Accuracy |
-|-----------|---------:|
-| ARC-Challenge | 0.2304 |
-| ARC-Easy | 0.3750 |
-| BoolQ | 0.6153 |
-| HellaSwag | 0.3027 |
-| OpenBookQA | 0.2620 |
-| PIQA | 0.6039 |
-| RACE | 0.2756 |
-| RTE | 0.5451 |
-| WinoGrande | 0.5201 |
+| Benchmark | 50% | 70% |
+|-----------|-----:|-----:|
+| ARC Challenge | 0.2287 | 0.2287 |
+| ARC Easy | 0.3750 | 0.3582 |
+| BoolQ | 0.6153 | 0.6217 |
+| HellaSwag | 0.3027 | 0.2845 |
+| OpenBookQA | 0.2620 | 0.2520 |
+| PIQA | 0.6039 | 0.5963 |
+| RACE | 0.2756 | 0.2632 |
+| RTE | 0.5451 | 0.4982 |
+| WinoGrande | 0.5201 | 0.5130 |
 
 ### Notes
 
