@@ -34,6 +34,21 @@
 | RTE | 0.5451 | 0.4982 |
 | WinoGrande | 0.5201 | 0.5130 |
 
+### OPT-125M
+
+| Benchmark | 50% | 70% | 90% |
+|-----------|-----:|-----:|-----:|
+| ARC Challenge | 0.2304 | 0.2287 | 0.2159 |
+| ARC Easy | 0.3750 | 0.3582 | 0.3300 |
+| BoolQ | 0.6153 | 0.6217 | 0.4235 |
+| HellaSwag | 0.3027 | 0.2845 | 0.2678 |
+| OpenBookQA | 0.2620 | 0.2520 | 0.2380 |
+| PIQA | 0.6039 | 0.5963 | 0.5609 |
+| RACE | 0.2756 | 0.2632 | 0.2450 |
+| RTE | 0.5451 | 0.4982 | 0.5199 |
+| WinoGrande | 0.5201 | 0.5130 | 0.4862 |
+>>>>>>> 1abdeec (Add 70% and 90% zero-shot benchmark results)
+
 ### Notes
 
 - Successfully reproduced the OPT-125M 90% sparsity results reported in the ELSA paper.
